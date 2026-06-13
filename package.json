@@ -3,12 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "contracts:build": "forge build --root contracts",
-    "contracts:test": "forge test --root contracts",
-    "lifi:intake": "tsx keeper/intake.ts",
-    "lifi:yield": "tsx keeper/yieldE2E.ts",
-    "keeper:auto-release": "tsx keeper/autoRelease.ts",
-    "keeper:yield-quote": "tsx keeper/yield.ts"
+    "build": "bash scripts/with-foundry.sh forge build --root contracts",
+    "test": "bash scripts/with-foundry.sh forge test --root contracts",
+    "test:v": "bash scripts/with-foundry.sh forge test --root contracts -vvv",
+    "e2e:local": "bash scripts/e2e.local.sh",
+    "server": "tsx server/index.ts",
+    "server:local": "bash scripts/server.local.sh",
+    "deploy:arc": "bash scripts/deploy.arc.sh",
+    "keeper:auto-release": "tsx keeper/autoRelease.ts"
   },
   "dependencies": {
     "@chainlink/cre-sdk": "^1.6.0",

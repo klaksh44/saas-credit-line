@@ -66,6 +66,15 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
     mapping(address vendor => uint64 expiry) internal _vendorCapExpiry;
     mapping(address vendor => uint16 allocationBps) internal _vendorCreditAllocationBps;
 
+    // --- World ID personhood (one free subscription per human) ---
+    // Validation happens off-chain (World ID cloud verify); the backend signs an EIP-712
+    // voucher that this contract verifies. The nullifierHash is the uniqueness key.
+    bytes32 public constant PERSONHOOD_TYPEHASH =
+        keccak256("Personhood(address user,bytes32 nullifierHash,uint64 deadline)");
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    address public worldIdSigner;
+    mapping(bytes32 nullifierHash => bool used) public usedNullifier;
+
     event Deposited(
         uint256 indexed stakeId,
         address indexed user,
@@ -100,6 +109,10 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
     event CreditTermsUpdated(
         address indexed vendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps
     );
+    event WorldIdSignerUpdated(address indexed previousSigner, address indexed newSigner);
+    event PersonhoodVerified(
+        bytes32 indexed nullifierHash, address indexed user, uint256 indexed stakeId
+    );
 
     error InvalidAddress();
     error InvalidAmount();
@@ -116,6 +129,11 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
     error CreditLimitExceeded();
     error RepayTooLarge();
     error UnauthorizedReportSender();
+    error WorldIdSignerNotSet();
+    error NullifierAlreadyUsed();
+    error VoucherExpired();
+    error InvalidVoucherSignature();
+    error InvalidSignatureLength();
 
     constructor(
         IERC20 usdc_,
@@ -136,6 +154,18 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
         treasury = msg.sender;
         disputeWindow = disputeWindow_;
         collateralBps = collateralBps_;
+
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256(bytes("StakeAndAdvance")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(this)
+            )
+        );
     }
 
     modifier onlyVendor() {
@@ -148,7 +178,37 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
         _;
     }
 
+    /// @notice Ungated deposit (e.g. EOA or relayer paying on behalf of `user`).
     function deposit(address user, uint256 amount) external nonReentrant returns (uint256 stakeId) {
+        return _deposit(user, amount);
+    }
+
+    /// @notice One-free-subscription-per-human deposit. World ID proof is validated off-chain
+    /// (cloud verify); the backend signs an EIP-712 voucher over (user, nullifierHash, deadline)
+    /// with `worldIdSigner`. The nullifierHash (unique per app+action per person) is consumed
+    /// here so a single human cannot claim a second free subscription / credit allocation.
+    function depositWithPersonhood(
+        address user,
+        uint256 amount,
+        bytes32 nullifierHash,
+        uint64 deadline,
+        bytes calldata signature
+    ) external nonReentrant returns (uint256 stakeId) {
+        if (worldIdSigner == address(0)) revert WorldIdSignerNotSet();
+        if (block.timestamp > deadline) revert VoucherExpired();
+        if (usedNullifier[nullifierHash]) revert NullifierAlreadyUsed();
+
+        bytes32 structHash =
+            keccak256(abi.encode(PERSONHOOD_TYPEHASH, user, nullifierHash, deadline));
+        bytes32 digest = keccak256(abi.encodePacked(hex"1901", DOMAIN_SEPARATOR, structHash));
+        if (_recover(digest, signature) != worldIdSigner) revert InvalidVoucherSignature();
+
+        usedNullifier[nullifierHash] = true;
+        stakeId = _deposit(user, amount);
+        emit PersonhoodVerified(nullifierHash, user, stakeId);
+    }
+
+    function _deposit(address user, uint256 amount) internal returns (uint256 stakeId) {
         if (user == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
 
@@ -262,6 +322,15 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
         }
 
         emit Repaid(msg.sender, amount, nextOutstanding);
+    }
+
+    function setWorldIdSigner(address newSigner) external onlyVendor {
+        if (newSigner == address(0)) revert InvalidAddress();
+
+        address previousSigner = worldIdSigner;
+        worldIdSigner = newSigner;
+
+        emit WorldIdSignerUpdated(previousSigner, newSigner);
     }
 
     function setTreasury(address newTreasury) external onlyVendor {
@@ -438,6 +507,28 @@ contract StakeAndAdvance is IReceiver, ReentrancyGuard {
         uint256 obligation = priorityObligation[vendor_];
         if (obligation == 0) return;
         priorityObligation[vendor_] = amount >= obligation ? 0 : obligation - amount;
+    }
+
+    /// @dev EIP-2098-free 65-byte ECDSA recovery with low-s + canonical-v enforcement.
+    function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
+        if (signature.length != 65) revert InvalidSignatureLength();
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 0x20))
+            v := byte(0, calldataload(add(signature.offset, 0x40)))
+        }
+        if (
+            uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+        ) revert InvalidVoucherSignature();
+        if (v != 27 && v != 28) revert InvalidVoucherSignature();
+
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert InvalidVoucherSignature();
+        return signer;
     }
 
     function _closeRepaymentCycle(address vendor_) internal {

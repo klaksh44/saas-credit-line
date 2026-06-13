@@ -7,6 +7,7 @@ import { IERC20 } from "../src/token/IERC20.sol";
 interface Vm {
     function envAddress(string calldata name) external view returns (address);
     function envOr(string calldata name, uint256 defaultValue) external view returns (uint256);
+    function envOr(string calldata name, address defaultValue) external view returns (address);
     function startBroadcast() external;
     function stopBroadcast() external;
 }
@@ -24,11 +25,16 @@ contract Deploy {
         uint64 disputeWindow =
             uint64(vm.envOr("DISPUTE_WINDOW_SECONDS", uint256(DEFAULT_DISPUTE_WINDOW)));
         uint16 collateralBps = uint16(vm.envOr("COLLATERAL_BPS", uint256(DEFAULT_COLLATERAL_BPS)));
+        address worldIdSigner = vm.envOr("WORLD_ID_SIGNER", address(0));
 
         vm.startBroadcast();
         deployed = new StakeAndAdvance(
             IERC20(usdc), arbiter, keystoneForwarder, disputeWindow, collateralBps
         );
+        // Deployer is the vendor (msg.sender), so it can set the World ID backend signer.
+        if (worldIdSigner != address(0)) {
+            deployed.setWorldIdSigner(worldIdSigner);
+        }
         vm.stopBroadcast();
     }
 }

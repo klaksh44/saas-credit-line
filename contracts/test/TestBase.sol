@@ -9,6 +9,12 @@ interface Vm {
     function expectEmit(bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData)
         external;
     function warp(uint256 newTimestamp) external;
+    function sign(uint256 privateKey, bytes32 digest)
+        external
+        pure
+        returns (uint8 v, bytes32 r, bytes32 s);
+    function addr(uint256 privateKey) external pure returns (address keyAddr);
+    function expectRevert() external;
 }
 
 contract TestBase {

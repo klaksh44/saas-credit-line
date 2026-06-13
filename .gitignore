@@ -3,3 +3,7 @@ contracts/out/
 contracts/broadcast/
 node_modules/
 .env
+# project-local toolchain installs (deleted with the folder)
+.foundry/
+.localhome/
+*.log

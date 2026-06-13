@@ -17,23 +17,32 @@ Use the ERC-20 USDC interface for all balances, allowances, and transfers. Arc's
 native gas token exposes 18 decimals, while the ERC-20 interface exposes 6
 decimals.
 
-## LI.FI Composer
+## World ID (one free subscription per human)
 
-- API base URL: `https://li.quest/v1`
-- API key: optional for baseline usage, provided via `x-lifi-api-key` when set
-- Composer detection: returned quote has `tool === "composer"`
-- Yield routing: Composer activates when `toToken` is a supported
-  vault/staking/deposit token.
+- SDK: `@worldcoin/idkit` (widget) + cloud verify (Developer Portal). Verification happens
+  **off-chain**; nothing is deployed on Arc, so it cannot fail on chain support.
+- Backend `/worldid/verify` validates personhood, then signs an **EIP-712 voucher** over
+  `Personhood(address user, bytes32 nullifierHash, uint64 deadline)` with `worldIdSigner`.
+- Contract `depositWithPersonhood(user, amount, nullifierHash, deadline, signature)` verifies
+  the voucher and consumes `usedNullifier[nullifierHash]` — a human (unique nullifier per
+  app+action) cannot claim a second free subscription / credit allocation.
+- Domain: `name="StakeAndAdvance", version="1", chainId, verifyingContract` (must match the
+  contract's `DOMAIN_SEPARATOR`).
+- `WORLD_ID_MODE=dev` is terminal-testable (no World App/QR); `cloud` uses the IDKit proof.
 
-Arc destination support and yield venue availability still need a live
-`/chains?chainTypes=EVM` and quote check from the target demo wallet. If Arc yield
-is unavailable, route collateral to Base Aave V3 as the TDD fallback.
+LI.FI was evaluated and dropped: LI.FI lists Arc in its registry but returns
+`No available quotes` for every Arc route (verified live), so it cannot move USDC to/from Arc.
 
 ## Chainlink CRE
 
 - Contract receiver entry point: `onReport(bytes metadata, bytes report)`
-- Trust boundary: `msg.sender` must be the KeystoneForwarder address for the
-  selected network.
+- Trust boundary: `msg.sender` must be the configured `keystoneForwarder` address.
+- **Arc has no KeystoneForwarder** (verified against the CRE forwarder directory; CRE lists
+  Arc Testnet as a supported network but no forwarder is deployed). So `keystoneForwarder` is
+  set to an **authorized reporter** EOA: the CRE workflow / backend runs the confidential
+  inference and the reporter key submits `onReport` with the signed cap. `REPORTER_PRIVATE_KEY`
+  must be the key for `KEYSTONE_FORWARDER`. (Optional native path: run a `writeReport` receiver
+  on Base Sepolia, which has a forwarder, and relay the cap to Arc.)
 - Report payload for this MVP:
   `abi.encode(address vendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps)`
 - Confidential inference path: CRE Confidential HTTP request with sandbox
