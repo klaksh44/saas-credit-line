@@ -1,7 +1,7 @@
 import { encodeAbiParameters, parseAbiParameters } from "viem";
 
 export type FinancialInputs = {
-  vendor: `0x${string}`;
+  vendor: `0x${string}`; // the company / borrower address
   currentDepositedPrincipalUsdc: number;
   monthlyRecurringRevenueUsd: number;
   grossMarginBps: number;
@@ -16,15 +16,15 @@ export type PlatformTrackRecord = {
   repaymentCount: number;
   onTimeRepaymentCount: number;
   lateRepaymentCount: number;
-  onTimeRepaymentBps: number;
-  totalRepaidUsdc: number;
+  totalInterestPaidUsdc: number;
+  defaultedAmountUsdc: number;
   currentOutstandingDebtUsdc: number;
   currentDebtDueAt: number;
 };
 
 export type ConfidentialInferenceResult = {
-  riskScore: number;
-  approvedMultiple: number;
+  riskScore: number; // 1..99 (higher = riskier)
+  approvedMultiple: number; // 0..3 multiple of margin-adjusted MRR
   rationale: string;
 };
 
@@ -32,7 +32,7 @@ export type UnderwritingReport = {
   vendor: `0x${string}`;
   cap: bigint;
   expiry: bigint;
-  creditAllocationBps: number;
+  interestRateBps: number;
   inference: ConfidentialInferenceResult;
   encodedPayload: `0x${string}`;
 };
@@ -60,13 +60,16 @@ export type WorkflowRuntime = {
 
 const USDC = 1_000_000n;
 const MAX_MULTIPLE = 3;
-const DEFAULT_NO_HISTORY_BPS = 4_000;
-const MIN_CREDIT_ALLOCATION_BPS = 1_000;
-const MAX_CREDIT_ALLOCATION_BPS = 7_000;
+const MIN_INTEREST_RATE_BPS = 600; // 6% APR floor
+const MAX_INTEREST_RATE_BPS = 2400; // 24% APR ceiling (well under the contract's 100% bound)
 const REPORT_TTL_SECONDS = 7n * 24n * 60n * 60n;
-const USDC_DECIMALS = 1_000_000;
 
-export function deriveConservativeCap(
+/**
+ * Conservative USDC credit cap = margin-adjusted MRR × approved multiple, scaled down by
+ * burn / delinquency / risk penalties. This is "how much credit the company qualifies for";
+ * how much can actually be drawn is additionally bounded on-chain by the pool's liquid cash.
+ */
+export function deriveCap(
   input: FinancialInputs,
   inference: ConfidentialInferenceResult,
 ): bigint {
@@ -77,120 +80,38 @@ export function deriveConservativeCap(
   const delinquencyPenalty = input.delinquencyRateBps > 1_000 ? 0.5 : 1;
   const riskPenalty = inference.riskScore > 70 ? 0.5 : 1;
 
-  const capUsd = (
-    marginAdjustedMrr
-    * sanitizedMultiple
-    * burnCoveragePenalty
-    * delinquencyPenalty
-    * riskPenalty
-  );
+  const capUsd =
+    marginAdjustedMrr * sanitizedMultiple * burnCoveragePenalty * delinquencyPenalty * riskPenalty;
 
-  return BigInt(Math.floor(capUsd)) * USDC;
+  return BigInt(Math.floor(Math.max(0, capUsd))) * USDC;
 }
 
-export function hasPlatformHistory(input: FinancialInputs): boolean {
-  const history = input.platformTrackRecord;
-  if (!history) return false;
-
-  return history.repaymentCount > 0;
-}
-
-export function deriveNoHistoryCap(input: FinancialInputs): bigint {
-  return deriveSupplyFromPrincipal(input, DEFAULT_NO_HISTORY_BPS);
-}
-
-export function deriveCap(
-  input: FinancialInputs,
-  inference: ConfidentialInferenceResult,
-): bigint {
-  const allocationBps = deriveCreditAllocationBps(input, inference);
-  const chainlinkSupply = deriveSupplyFromPrincipal(input, allocationBps);
-
-  if (!hasPlatformHistory(input)) {
-    return chainlinkSupply;
-  }
-
-  const inferredCap = deriveConservativeCap(input, inference);
-  return inferredCap < chainlinkSupply ? inferredCap : chainlinkSupply;
-}
-
-export function derivePlatformTrackRecordCap(input: FinancialInputs): bigint {
-  const history = input.platformTrackRecord;
-  if (!history || history.repaymentCount === 0) return deriveNoHistoryCap(input);
-
-  const onTimeBps = Math.max(0, Math.min(10_000, history.onTimeRepaymentBps));
-  const latePenaltyBps = Math.min(3_000, history.lateRepaymentCount * 1_000);
-  const outstandingPenaltyBps = history.currentOutstandingDebtUsdc > 0 ? 1_000 : 0;
-  const rawTrackRecordBps = (
-    4_000
-    + onTimeBps / 2
-    - latePenaltyBps
-    - outstandingPenaltyBps
-  );
-  const trackRecordBps = Math.max(1_000, Math.min(10_000, rawTrackRecordBps));
-
-  return deriveSupplyFromPrincipal(input, Math.floor(trackRecordBps));
-}
-
-export function deriveCreditAllocationBps(
+/**
+ * Risk-priced APR for the pool's loan to the company. Riskier company → higher rate (the spread the
+ * member-lenders earn). Monotonic in the confidential AI risk score, with burn/delinquency bumps.
+ */
+export function deriveInterestRateBps(
   input: FinancialInputs,
   inference: ConfidentialInferenceResult,
 ): number {
-  if (!hasPlatformHistory(input)) return DEFAULT_NO_HISTORY_BPS;
+  const base = MIN_INTEREST_RATE_BPS;
+  const riskComponent = Math.max(0, inference.riskScore) * 18; // ~+1782 bps at risk 99
+  const burnPenalty = input.monthlyBurnUsd > input.cashBalanceUsd ? 400 : 0;
+  const delinquencyPenalty = input.delinquencyRateBps > 1_000 ? 400 : 0;
 
-  const history = input.platformTrackRecord;
-  if (!history) return DEFAULT_NO_HISTORY_BPS;
-
-  const onTimeBps = Math.max(0, Math.min(10_000, history.onTimeRepaymentBps));
-  const repaymentDepthBps = Math.min(1_000, history.repaymentCount * 200);
-  const volumeDepthBps = Math.min(1_000, Math.floor(history.totalRepaidUsdc / 1_000) * 100);
-  const onTimeBonusBps = Math.floor((onTimeBps - 8_000) / 4);
-  const latePenaltyBps = Math.min(2_500, history.lateRepaymentCount * 800);
-  const outstandingPenaltyBps = history.currentOutstandingDebtUsdc > 0 ? 750 : 0;
-  const riskPenaltyBps = Math.max(0, inference.riskScore - 50) * 50;
-  const delinquencyPenaltyBps = input.delinquencyRateBps > 500
-    ? input.delinquencyRateBps / 2
-    : 0;
-  const burnPenaltyBps = input.monthlyBurnUsd > input.cashBalanceUsd ? 750 : 0;
-
-  const rawBps = (
-    DEFAULT_NO_HISTORY_BPS
-    + onTimeBonusBps
-    + repaymentDepthBps
-    + volumeDepthBps
-    - latePenaltyBps
-    - outstandingPenaltyBps
-    - riskPenaltyBps
-    - delinquencyPenaltyBps
-    - burnPenaltyBps
-  );
-
-  return Math.floor(
-    Math.max(MIN_CREDIT_ALLOCATION_BPS, Math.min(MAX_CREDIT_ALLOCATION_BPS, rawBps)),
-  );
-}
-
-export function deriveSupplyFromPrincipal(
-  input: FinancialInputs,
-  creditAllocationBps: number,
-): bigint {
-  const principalUnits = BigInt(
-    Math.floor(Math.max(0, input.currentDepositedPrincipalUsdc) * USDC_DECIMALS),
-  );
-  return principalUnits * BigInt(Math.floor(creditAllocationBps)) / 10_000n;
+  const raw = base + riskComponent + burnPenalty + delinquencyPenalty;
+  return Math.floor(Math.max(MIN_INTEREST_RATE_BPS, Math.min(MAX_INTEREST_RATE_BPS, raw)));
 }
 
 export function encodeCreditCapReport(
   vendor: `0x${string}`,
   cap: bigint,
   expiry: bigint,
-  creditAllocationBps: number,
+  interestRateBps: number,
 ): `0x${string}` {
   return encodeAbiParameters(
-    parseAbiParameters(
-      "address vendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps",
-    ),
-    [vendor, cap, expiry, creditAllocationBps],
+    parseAbiParameters("address vendor, uint256 cap, uint64 expiry, uint16 interestRateBps"),
+    [vendor, cap, expiry, interestRateBps],
   );
 }
 
@@ -200,22 +121,17 @@ export async function underwriteVendor(
   nowSeconds: bigint,
 ): Promise<UnderwritingReport> {
   const inference = await confidentialInfer(input);
-  const creditAllocationBps = deriveCreditAllocationBps(input, inference);
   const cap = deriveCap(input, inference);
+  const interestRateBps = deriveInterestRateBps(input, inference);
   const expiry = nowSeconds + REPORT_TTL_SECONDS;
 
   return {
     vendor: input.vendor,
     cap,
     expiry,
-    creditAllocationBps,
+    interestRateBps,
     inference,
-    encodedPayload: encodeCreditCapReport(
-      input.vendor,
-      cap,
-      expiry,
-      creditAllocationBps,
-    ),
+    encodedPayload: encodeCreditCapReport(input.vendor, cap, expiry, interestRateBps),
   };
 }
 
@@ -236,13 +152,12 @@ export async function workflow(
           "content-type": "application/json",
         },
         body: {
-          task: "underwrite_usdc_credit_cap",
+          task: "underwrite_usdc_credit_line",
           financials,
           policy: {
-            noPlatformHistoryCapBps: DEFAULT_NO_HISTORY_BPS,
-            minCreditAllocationBps: MIN_CREDIT_ALLOCATION_BPS,
-            maxCreditAllocationBps: MAX_CREDIT_ALLOCATION_BPS,
-            currentDepositedPrincipalUsdc: financials.currentDepositedPrincipalUsdc,
+            minInterestRateBps: MIN_INTEREST_RATE_BPS,
+            maxInterestRateBps: MAX_INTEREST_RATE_BPS,
+            maxMultiple: MAX_MULTIPLE,
             platformTrackRecord: financials.platformTrackRecord ?? null,
           },
         },

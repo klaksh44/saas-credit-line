@@ -2,6 +2,14 @@
 
 Last updated: 2026-06-13
 
+## Concept
+
+A per-company **credit pool**: customers deposit USDC for NAV-based yield-bearing shares; the pool
+lends an AI-underwritten, undercollateralized, **interest-bearing** credit line to the one company.
+Interest paid raises NAV (members earn the spread); a default writes down principal and lowers NAV
+(members bear the loss). Accounting is **cash basis**: `totalAssets = cash + outstandingPrincipal`,
+and accrued-but-unpaid interest is never counted as an asset.
+
 ## Arc Testnet
 
 - Chain ID: `5042002`
@@ -13,54 +21,51 @@ Last updated: 2026-06-13
 - ERC-20 USDC decimals: `6`
 - Foundry EVM version: `shanghai`
 
-Use the ERC-20 USDC interface for all balances, allowances, and transfers. Arc's
-native gas token exposes 18 decimals, while the ERC-20 interface exposes 6
-decimals.
+Use the ERC-20 USDC interface for all balances, allowances, and transfers. Arc's native gas token
+exposes 18 decimals, while the ERC-20 interface exposes 6 decimals.
 
-## World ID (one free subscription per human)
+## World ID — REMOVED
 
-- SDK: `@worldcoin/idkit` (widget) + cloud verify (Developer Portal). Verification happens
-  **off-chain**; nothing is deployed on Arc, so it cannot fail on chain support.
-- Backend `/worldid/verify` validates personhood, then signs an **EIP-712 voucher** over
-  `Personhood(address user, bytes32 nullifierHash, uint64 deadline)` with `worldIdSigner`.
-- Contract `depositWithPersonhood(user, amount, nullifierHash, deadline, signature)` verifies
-  the voucher and consumes `usedNullifier[nullifierHash]` — a human (unique nullifier per
-  app+action) cannot claim a second free subscription / credit allocation.
-- Domain: `name="StakeAndAdvance", version="1", chainId, verifyingContract` (must match the
-  contract's `DOMAIN_SEPARATOR`).
-- `WORLD_ID_MODE=dev` is terminal-testable (no World App/QR); `cloud` uses the IDKit proof.
+The original design gated "one free subscription per human" with a World ID nullifier + EIP-712
+voucher. The pivot to a paid deposit pool makes that gate pointless: **money is the gate** (there is
+no free good to sybil-farm). All World ID surface was deleted — `depositWithPersonhood`, the
+EIP-712 personhood voucher, `usedNullifier`, `worldIdSigner`, `server/worldid.ts`, `server/voucher.ts`,
+and the `/worldid/*` routes. (If governance or a free tier is ever added, personhood gets a real job
+again.)
 
-LI.FI was evaluated and dropped: LI.FI lists Arc in its registry but returns
-`No available quotes` for every Arc route (verified live), so it cannot move USDC to/from Arc.
+## Access & privacy seams (Dynamic, Unlink)
 
-## Chainlink CRE
+- **Dynamic** — embedded-wallet onboarding + relayer funding. On-chain hook in place:
+  `depositFor(address member, uint256 amount)` lets a relayer pay in and credit a customer's shares.
+- **Unlink** — confidential balances/positions ("confidential-in via Chainlink → private on-chain").
+  Documented integration point; not wired to the live SDK in this build.
 
-- Contract receiver entry point: `onReport(bytes metadata, bytes report)`
+## Chainlink CRE (Confidential AI underwriting)
+
+- Contract receiver entry point: `onReport(bytes metadata, bytes report)`.
 - Trust boundary: `msg.sender` must be the configured `keystoneForwarder` address.
-- **Arc has no KeystoneForwarder** (verified against the CRE forwarder directory; CRE lists
-  Arc Testnet as a supported network but no forwarder is deployed). So `keystoneForwarder` is
-  set to an **authorized reporter** EOA: the CRE workflow / backend runs the confidential
-  inference and the reporter key submits `onReport` with the signed cap. `REPORTER_PRIVATE_KEY`
-  must be the key for `KEYSTONE_FORWARDER`. (Optional native path: run a `writeReport` receiver
-  on Base Sepolia, which has a forwarder, and relay the cap to Arc.)
-- Report payload for this MVP:
-  `abi.encode(address vendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps)`
-- Confidential inference path: CRE Confidential HTTP request with sandbox
-  endpoint/API key supplied outside the repository.
-- Credit-limit policy:
-  - vendor history comes from this platform's onchain repayment track record
-  - the contract exposes drawdowns, repayment count, on-time repayments, late
-    repayments, total repaid, current outstanding debt, and current debt due date
-  - Chainlink CRE determines `creditAllocationBps`, the percentage of user
-    principal that becomes vendor borrowable supply on new deposits
-  - if no platform history exists, `creditAllocationBps` defaults to `40%`
-  - if platform history exists, CRE raises or lowers `creditAllocationBps` from
-    on-time repayment rate, repayment depth, repaid volume, late payments,
-    current outstanding debt, confidential AI risk score, delinquency, and burn
-  - `creditAllocationBps` has a hard maximum of `70%`; neither CRE nor a bad
-    report can increase borrowable supply above that ceiling
-  - CRE also reports `cap`, a risk ceiling; the contract enforces the final
-    borrow limit as `min(vendorCreditAllocationTotal, vendorCreditCap)`
+- **Arc has no KeystoneForwarder** (CRE lists Arc Testnet as supported but no forwarder is deployed),
+  so `keystoneForwarder` is set to an **authorized reporter** EOA: the CRE workflow / backend runs the
+  confidential inference and the reporter key submits `onReport` with the signed terms.
+  `REPORTER_PRIVATE_KEY` must be the key for `KEYSTONE_FORWARDER`.
+- **Report payload:** `abi.encode(address company, uint256 cap, uint64 expiry, uint16 interestRateBps)`.
+  - `cap` — the credit ceiling (margin-adjusted MRR × approved multiple, scaled by burn/delinquency/
+    risk penalties). How much the company *qualifies* to borrow; actual draws are additionally bounded
+    on-chain by liquid cash (the reserve).
+  - `interestRateBps` — the **risk-priced APR** the company pays (riskier → higher → bigger member
+    spread). Clamped off-chain to `[600, 2400]` bps; the contract enforces a hard ceiling of
+    `10000` bps (100%).
+  - `expiry` — a TTL (7 days) anchored to **chain time** (the backend reads the latest block timestamp,
+    so the cap stays consistent on a time-warped test chain). After expiry, `activeCreditCap()`
+    returns 0 and borrowing is frozen until re-underwritten.
+- Underwriting inputs include the on-chain **track record** (`trackRecord()`): drawdowns, repayments,
+  on-time vs late counts, total interest paid, defaulted amount, current outstanding, due date.
+- Confidential inference path: CRE Confidential HTTP request with sandbox endpoint/API key supplied
+  outside the repository; unset → a deterministic local risk model runs so the flow is offline-testable.
 
-The Arc testnet KeystoneForwarder address still needs final confirmation from
-the current Chainlink forwarder directory or hackathon resources before deploy.
+## Default / keeper
+
+- A loan is defaultable once `now > dueAt + defaultGracePeriod` with principal outstanding.
+  `markDefaulted()` is **permissionless** and writes off the outstanding principal (NAV falls).
+- `keeper/markDefault.ts` is the terminal-testable keeper; production moves this into a CRE workflow
+  (CRE replaces the deprecated Chainlink Automation/Functions).

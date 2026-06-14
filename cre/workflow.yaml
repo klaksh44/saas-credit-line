@@ -1,5 +1,5 @@
 name: stake-and-advance-underwriting
-description: Confidential AI underwriting report for StakeAndAdvance credit caps.
+description: Confidential AI underwriting report — credit cap + interest rate for the company pool.
 triggers:
   - type: http
     name: underwrite-vendor
