@@ -1,13 +1,22 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
+import { loadArtifact } from "./artifacts.ts";
+import { publicClientFor } from "./chain.ts";
 import { configFromEnv, type ServerConfig } from "./config.ts";
 import { underwriteAndDeliver } from "./underwrite.ts";
-import { signPersonhoodVoucher } from "./voucher.ts";
-import { verifyWorldId } from "./worldid.ts";
+
+const stakeAbi = loadArtifact("StakeAndAdvance").abi as never;
+
+// Permissive CORS so a browser frontend (e.g. Next.js on :3000) can call these endpoints.
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type",
+};
 
 function send(res: http.ServerResponse, code: number, body: unknown): void {
   const payload = JSON.stringify(body, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
-  res.writeHead(code, { "content-type": "application/json" });
+  res.writeHead(code, { "content-type": "application/json", ...CORS_HEADERS });
   res.end(payload);
 }
 
@@ -18,72 +27,53 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
 }
 
+async function readPoolState(config: ServerConfig) {
+  const publicClient = publicClientFor(config.chainId, config.rpcUrl);
+  const s = (await publicClient.readContract({
+    address: config.contract,
+    abi: stakeAbi,
+    functionName: "poolState",
+  })) as readonly [bigint, bigint, bigint, bigint, bigint, bigint, number, number, number, boolean];
+  return {
+    totalAssets: s[0].toString(),
+    cash: s[1].toString(),
+    outstandingPrincipal: s[2].toString(),
+    totalShares: s[3].toString(),
+    navPerShare1e18: s[4].toString(),
+    creditCap: s[5].toString(),
+    capExpiry: s[6].toString(),
+    interestRateBps: Number(s[7]),
+    dueAt: s[8].toString(),
+    defaulted: s[9],
+  };
+}
+
 export function buildHandler(config: ServerConfig) {
   return async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     try {
       const url = req.url ?? "/";
 
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, CORS_HEADERS);
+        res.end();
+        return;
+      }
+
       if (req.method === "GET" && url === "/health") {
         return send(res, 200, {
           ok: true,
-          worldIdMode: config.worldIdMode,
           chainId: config.chainId,
           contract: config.contract,
           confidentialAi: config.confidentialAiEndpoint ? "cloud" : "dev",
         });
       }
 
-      // World ID V4 server-side signRequest. Dev mode returns a stub rp_context;
-      // cloud mode would sign with the Developer Portal app key.
-      if (req.method === "POST" && url === "/worldid/sign") {
-        const body = await readJson(req);
-        if (config.worldIdMode === "dev") {
-          return send(res, 200, {
-            action: config.worldAction,
-            rp_context: { rp_id: config.worldAppId ?? "app_dev", nonce: `${Date.now()}`, dev: true },
-          });
-        }
-        return send(res, 501, {
-          error: "cloud signRequest not configured; provide app signing key (see docs)",
-        });
+      // Read the live pool snapshot (NAV, assets, cash, debt, cap, rate) straight from the contract.
+      if (req.method === "GET" && url === "/pool/state") {
+        return send(res, 200, await readPoolState(config));
       }
 
-      // Validate personhood and issue an EIP-712 voucher the contract accepts.
-      if (req.method === "POST" && url === "/worldid/verify") {
-        const body = (await readJson(req)) as {
-          user?: `0x${string}`;
-          nullifier_hash?: `0x${string}`;
-          id?: string;
-          proof?: Record<string, unknown>;
-          signal?: string;
-        };
-        if (!body.user) return send(res, 400, { error: "missing `user`" });
-
-        const result = await verifyWorldId(config, { user: body.user, ...body });
-        if (!result.ok) {
-          return send(res, 401, { error: "world id verification failed", detail: result.detail });
-        }
-
-        const deadline = BigInt(Math.floor(Date.now() / 1000) + config.voucherTtlSeconds);
-        const signature = await signPersonhoodVoucher({
-          signerKey: config.worldIdSignerKey,
-          chainId: config.chainId,
-          verifyingContract: config.contract,
-          user: body.user,
-          nullifierHash: result.nullifierHash,
-          deadline,
-        });
-
-        return send(res, 200, {
-          user: body.user,
-          nullifierHash: result.nullifierHash,
-          deadline: deadline.toString(),
-          signature,
-          mode: result.mode,
-        });
-      }
-
-      // Run confidential underwriting and deliver the signed credit cap on-chain.
+      // Run confidential underwriting and deliver the signed credit cap + interest rate on-chain.
       if (req.method === "POST" && url === "/cre/underwrite") {
         const body = await readJson(req);
         const financials = (body.financials ?? body) as Record<string, unknown>;
@@ -122,7 +112,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   }
   const config = configFromEnv();
   startServer(config).then(({ url }) => {
-    console.log(`[server] listening on ${url}  (worldIdMode=${config.worldIdMode})`);
+    console.log(`[server] listening on ${url}`);
     console.log(`[server] contract=${config.contract} chainId=${config.chainId}`);
   });
 }

@@ -1,174 +1,108 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import { Fixtures } from "./Fixtures.sol";
 import { StakeAndAdvance } from "../src/StakeAndAdvance.sol";
-import { MockUSDC } from "./mocks/MockUSDC.sol";
-import { TestBase } from "./TestBase.sol";
 
-contract StakeAndAdvanceHarness is StakeAndAdvance {
-    constructor(
-        MockUSDC usdc_,
-        address arbiter_,
-        address keystoneForwarder_,
-        uint64 disputeWindow_,
-        uint16 collateralBps_
-    ) StakeAndAdvance(usdc_, arbiter_, keystoneForwarder_, disputeWindow_, collateralBps_) { }
-
-    function setCreditCap(address vendor_, uint256 cap, uint64 expiry) external {
-        _setCreditCap(vendor_, cap, expiry);
+/// Core pool / share accounting: deposit, redeem, NAV, transfer, reserve liquidity.
+contract StakeAndAdvanceTest is Fixtures {
+    function setUp() public {
+        _deployPool(0);
     }
 
-    function setCreditTerms(address vendor_, uint256 cap, uint64 expiry, uint16 creditAllocationBps)
-        external
-    {
-        _setCreditTerms(vendor_, cap, expiry, creditAllocationBps);
-    }
-}
-
-contract StakeAndAdvanceTest is TestBase {
-    event Deposited(
-        uint256 indexed stakeId,
-        address indexed user,
-        address indexed vendor,
-        address payer,
-        uint256 amount,
-        uint256 collateral,
-        uint256 creditAllocation
-    );
-
-    uint256 internal constant USDC = 1e6;
-
-    MockUSDC internal token;
-    StakeAndAdvanceHarness internal creditLine;
-
-    address internal vendor = address(0xA11CE);
-    address internal arbiter = address(0xA4B17E4);
-    address internal forwarder = address(0xF04);
-    address internal user = address(0xB0B);
-    address internal payer = address(0xC0FFEE);
-
-    function setUp() external {
-        token = new MockUSDC();
-        vm.prank(vendor);
-        creditLine = new StakeAndAdvanceHarness(token, arbiter, forwarder, 10 minutes, 6000);
-
-        token.mint(user, 1_000 * USDC);
-        token.mint(payer, 1_000 * USDC);
-        token.mint(vendor, 1_000 * USDC);
-
-        vm.prank(user);
-        token.approve(address(creditLine), type(uint256).max);
-        vm.prank(payer);
-        token.approve(address(creditLine), type(uint256).max);
-        vm.prank(vendor);
-        token.approve(address(creditLine), type(uint256).max);
+    function test_constructor_setsState() public view {
+        assertEq(address(pool.usdc()), address(usdc), "usdc");
+        assertEq(pool.company(), address(this), "company");
+        assertEq(pool.keystoneForwarder(), reporter, "forwarder");
+        assertEq(uint256(pool.repaymentWindow()), uint256(REPAYMENT_WINDOW), "repaymentWindow");
+        assertEq(uint256(pool.defaultGracePeriod()), uint256(GRACE), "grace");
+        assertEq(uint256(pool.minReserveBps()), 0, "reserveBps");
+        assertEq(uint256(pool.navPerShare1e18()), 1e18, "nav starts at 1.0");
     }
 
-    function test_constructor_setsState() external view {
-        assertEq(address(creditLine.usdc()), address(token), "usdc");
-        assertEq(creditLine.vendor(), vendor, "vendor");
-        assertEq(creditLine.arbiter(), arbiter, "arbiter");
-        assertEq(creditLine.disputeWindow(), 10 minutes, "window");
-        assertEq(creditLine.collateralBps(), 6000, "collateral bps");
-        assertEq(creditLine.vendorCreditAllocationBps(vendor), 4000, "default allocation bps");
+    function test_firstDeposit_mintsOneToOne() public {
+        uint256 shares = _deposit(alice, 500 * USDC1);
+        assertEq(shares, 500 * USDC1, "shares 1:1 on bootstrap");
+        assertEq(pool.sharesOf(alice), 500 * USDC1, "alice shares");
+        assertEq(pool.totalShares(), 500 * USDC1, "totalShares");
+        assertEq(pool.cash(), 500 * USDC1, "cash");
+        assertEq(pool.totalAssets(), 500 * USDC1, "totalAssets");
+        assertEq(uint256(pool.navPerShare1e18()), 1e18, "nav still 1.0");
     }
 
-    function test_deposit_splitsTranches() external {
-        uint256 amount = 250 * USDC;
+    function test_secondDeposit_pricedAtNav() public {
+        _deposit(alice, 1000 * USDC1);
+        // Lift NAV to 1.1 via a profitable cycle (1000 @ 10% for one year => +100 interest).
+        _profitableCycle(1000 * USDC1, 1000, pool.SECONDS_PER_YEAR());
+        assertEq(uint256(pool.navPerShare1e18()), 1.1e18, "nav lifted to 1.1");
 
-        vm.expectEmit(true, true, true, true);
-        emit Deposited(1, user, vendor, user, amount, 150 * USDC, 100 * USDC);
-
-        vm.prank(user);
-        uint256 stakeId = creditLine.deposit(user, amount);
-
-        (
-            address stakeUser,
-            address stakeVendor,
-            uint256 stakeAmount,
-            uint256 collateral,
-            uint256 creditAllocation,,
-            StakeAndAdvance.StakeState state,,
-        ) = creditLine.stakes(stakeId);
-
-        assertEq(stakeUser, user, "stake user");
-        assertEq(stakeVendor, vendor, "stake vendor");
-        assertEq(stakeAmount, amount, "amount");
-        assertEq(collateral, 150 * USDC, "collateral");
-        assertEq(creditAllocation, 100 * USDC, "allocation");
-        assertEq(uint256(state), uint256(StakeAndAdvance.StakeState.Active), "active");
-        assertEq(creditLine.vendorCreditAllocationTotal(vendor), 100 * USDC, "total allocation");
-        assertEq(token.balanceOf(address(creditLine)), amount, "contract balance");
-        assertEq(token.balanceOf(user), 750 * USDC, "user balance");
+        // Bob deposits 1100 at NAV 1.1 => 1000 shares.
+        uint256 shares = _deposit(bob, 1100 * USDC1);
+        assertEq(shares, 1000 * USDC1, "bob shares priced at NAV");
+        assertEq(pool.totalShares(), 2000 * USDC1, "totalShares");
+        assertEq(uint256(pool.navPerShare1e18()), 1.1e18, "nav unchanged by fair-priced deposit");
     }
 
-    function test_depositOnBehalf_creditsExplicitUser() external {
-        vm.prank(payer);
-        uint256 stakeId = creditLine.deposit(user, 250 * USDC);
-
-        (address stakeUser,,,,,,,,) = creditLine.stakes(stakeId);
-
-        assertEq(stakeUser, user, "stake user");
-        assertEq(token.balanceOf(payer), 750 * USDC, "payer balance");
-        assertEq(token.balanceOf(user), 1_000 * USDC, "user balance");
+    function test_redeem_returnsNavValue() public {
+        _deposit(alice, 400 * USDC1);
+        vm.prank(alice);
+        uint256 assets = pool.redeem(400 * USDC1);
+        assertEq(assets, 400 * USDC1, "redeem at NAV 1.0");
+        assertEq(usdc.balanceOf(alice), 400 * USDC1, "alice got USDC");
+        assertEq(pool.totalShares(), 0, "shares burned");
+        assertEq(pool.cash(), 0, "cash drained");
     }
 
-    function test_deposit_usesAttestedCreditAllocationBps() external {
-        creditLine.setCreditTerms(vendor, 175 * USDC, 0, 7000);
-
-        vm.prank(user);
-        uint256 stakeId = creditLine.deposit(user, 250 * USDC);
-
-        (,,, uint256 collateral, uint256 creditAllocation,,,,) = creditLine.stakes(stakeId);
-
-        assertEq(creditLine.vendorCreditAllocationBps(vendor), 7000, "allocation bps");
-        assertEq(collateral, 75 * USDC, "collateral");
-        assertEq(creditAllocation, 175 * USDC, "allocation");
-        assertEq(creditLine.vendorCreditAllocationTotal(vendor), 175 * USDC, "total allocation");
+    function test_redeem_revertsWhenIlliquid() public {
+        _deposit(alice, 1000 * USDC1);
+        _deliverTerms(1000 * USDC1, _farExpiry(), 1000);
+        pool.drawdown(1000 * USDC1); // all cash lent out
+        assertEq(pool.cash(), 0, "no liquid cash");
+        vm.prank(alice);
+        vm.expectRevert(StakeAndAdvance.InsufficientLiquidity.selector);
+        pool.redeem(1000 * USDC1);
     }
 
-    function test_creditLimit_zeroUntilAttested() external {
-        vm.prank(user);
-        creditLine.deposit(user, 250 * USDC);
-
-        assertEq(creditLine.effectiveCreditLimit(vendor), 0, "limit");
+    function test_depositFor_creditsBeneficiary() public {
+        // Company (address(this)) pays on behalf of bob (relayer / Dynamic funding seam).
+        uint256 shares = pool.depositFor(bob, 250 * USDC1);
+        assertEq(shares, 250 * USDC1, "shares minted");
+        assertEq(pool.sharesOf(bob), 250 * USDC1, "bob credited");
+        assertEq(pool.sharesOf(address(this)), 0, "payer holds none");
     }
 
-    function test_drawdown_withinLimit() external {
-        vm.prank(user);
-        creditLine.deposit(user, 250 * USDC);
-        creditLine.setCreditCap(vendor, 100 * USDC, 0);
-
-        vm.prank(vendor);
-        creditLine.drawdown(100 * USDC);
-
-        assertEq(creditLine.currentOutstandingDebt(vendor), 100 * USDC, "debt");
-        assertEq(token.balanceOf(vendor), 1_100 * USDC, "vendor balance");
-        assertEq(token.balanceOf(address(creditLine)), 150 * USDC, "contract balance");
+    function test_transferShares_movesBalance() public {
+        _deposit(alice, 300 * USDC1);
+        vm.prank(alice);
+        pool.transferShares(bob, 100 * USDC1);
+        assertEq(pool.sharesOf(alice), 200 * USDC1, "alice debited");
+        assertEq(pool.sharesOf(bob), 100 * USDC1, "bob credited");
     }
 
-    function test_drawdown_revertsOverLimit() external {
-        vm.prank(user);
-        creditLine.deposit(user, 250 * USDC);
-        creditLine.setCreditCap(vendor, 99 * USDC, 0);
-
-        vm.expectRevert(StakeAndAdvance.CreditLimitExceeded.selector);
-        vm.prank(vendor);
-        creditLine.drawdown(100 * USDC);
+    function test_transferShares_revertsOverBalance() public {
+        _deposit(alice, 50 * USDC1);
+        vm.prank(alice);
+        vm.expectRevert(StakeAndAdvance.InsufficientShares.selector);
+        pool.transferShares(bob, 51 * USDC1);
     }
 
-    function test_repay_reducesDebt() external {
-        vm.prank(user);
-        creditLine.deposit(user, 250 * USDC);
-        creditLine.setCreditCap(vendor, 100 * USDC, 0);
+    function test_deposit_revertsOnZero() public {
+        vm.expectRevert(StakeAndAdvance.InvalidAmount.selector);
+        pool.deposit(0);
+    }
 
-        vm.prank(vendor);
-        creditLine.drawdown(100 * USDC);
+    function test_proRataYield_sharedAcrossMembers() public {
+        // Two members enter equally at NAV 1.0, then a profitable cycle lifts NAV for both.
+        _deposit(alice, 1000 * USDC1);
+        _deposit(bob, 1000 * USDC1);
+        _profitableCycle(2000 * USDC1, 1000, pool.SECONDS_PER_YEAR()); // +200 interest on 2000
 
-        vm.prank(vendor);
-        creditLine.repay(40 * USDC);
-
-        assertEq(creditLine.currentOutstandingDebt(vendor), 60 * USDC, "debt");
-        assertEq(token.balanceOf(address(creditLine)), 190 * USDC, "contract balance");
+        // NAV = 2200/2000 = 1.1 => each 1000-share holder redeems 1100.
+        vm.prank(alice);
+        uint256 a = pool.redeem(1000 * USDC1);
+        vm.prank(bob);
+        uint256 b = pool.redeem(1000 * USDC1);
+        assertEq(a, 1100 * USDC1, "alice pro-rata yield");
+        assertEq(b, 1100 * USDC1, "bob pro-rata yield");
     }
 }

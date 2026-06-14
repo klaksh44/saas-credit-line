@@ -38,7 +38,12 @@ async function cloudInfer(
 }
 
 export async function underwriteAndDeliver(config: ServerConfig, financials: FinancialInputs) {
-  const now = BigInt(Math.floor(Date.now() / 1000));
+  const wallet = walletClientFor(config.reporterKey, config.chainId, config.rpcUrl);
+  const publicClient = publicClientFor(config.chainId, config.rpcUrl);
+
+  // Anchor the cap's expiry (TTL) to chain time, not wall-clock — the on-chain cap is checked
+  // against block.timestamp, so a time-warped test chain must use the chain's clock.
+  const now = (await publicClient.getBlock()).timestamp;
   const infer = config.confidentialAiEndpoint
     ? (input: FinancialInputs) => cloudInfer(config, input)
     : async (input: FinancialInputs) => devInfer(input);
@@ -47,8 +52,6 @@ export async function underwriteAndDeliver(config: ServerConfig, financials: Fin
 
   // Deliver the attested cap on-chain. The reporter key must equal the contract's
   // keystoneForwarder address (the authorized reporter on Arc, which has no forwarder).
-  const wallet = walletClientFor(config.reporterKey, config.chainId, config.rpcUrl);
-  const publicClient = publicClientFor(config.chainId, config.rpcUrl);
   const hash = await wallet.writeContract({
     address: config.contract,
     abi: stakeAbi,
@@ -61,7 +64,7 @@ export async function underwriteAndDeliver(config: ServerConfig, financials: Fin
     vendor: report.vendor,
     cap: report.cap.toString(),
     expiry: report.expiry.toString(),
-    creditAllocationBps: report.creditAllocationBps,
+    interestRateBps: report.interestRateBps,
     inference: report.inference,
     mode: config.confidentialAiEndpoint ? "cloud" : "dev",
     txHash: hash,

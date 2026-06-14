@@ -6,543 +6,417 @@ import { IERC20 } from "./token/IERC20.sol";
 import { SafeERC20 } from "./token/SafeERC20.sol";
 import { ReentrancyGuard } from "./utils/ReentrancyGuard.sol";
 
+/// @title StakeAndAdvance — "the customers are the bank"
+/// @notice A per-company, single-borrower credit pool. Members (the company's customers) deposit
+///         USDC and receive NAV-based yield-bearing shares. The pool lends an AI-underwritten,
+///         undercollateralized credit line to the company; drawdowns accrue interest. Interest paid
+///         in raises the pool's net asset value (NAV) so every share is worth more; a default writes
+///         down outstanding principal so NAV falls — shareholders bear the credit risk, like a bank.
+///         Members exit by redeeming shares at the current NAV, bounded by the liquid reserve.
+/// @dev    Accounting is strictly cash-basis: `totalAssets = cash + outstandingPrincipal`. Accrued-but-
+///         -unpaid interest is NOT counted as an asset, so the pool can never promise more than it holds
+///         and a default can only lose principal that was genuinely lent. The credit cap and interest
+///         rate are delivered by an authorized Chainlink reporter through `onReport` (Arc has no
+///         KeystoneForwarder, so a reporter key plays that role).
 contract StakeAndAdvance is IReceiver, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint16 public constant BPS = 10_000;
-    uint16 public constant MAX_CREDIT_ALLOCATION_BPS = 7_000;
-    uint64 public constant REPAYMENT_WINDOW = 30 days;
-
-    enum StakeState {
-        None,
-        Active,
-        Cancelled,
-        Disputed,
-        Resolved
-    }
-
-    enum Outcome {
-        RefundUser,
-        ReleaseToVendor,
-        Split
-    }
-
-    struct Stake {
-        address user;
-        address vendor;
-        uint256 amount;
-        uint256 collateral;
-        uint256 creditAllocation;
-        uint256 pendingObligation;
-        StakeState state;
-        uint64 createdAt;
-        uint64 disputedAt;
-    }
+    uint16 public constant MAX_INTEREST_RATE_BPS = 10_000; // 100% APR ceiling (sanity bound)
+    uint64 public constant SECONDS_PER_YEAR = 365 days;
 
     IERC20 public immutable usdc;
-    address public immutable vendor;
-    address public arbiter;
-    address public keystoneForwarder;
-    address public treasury;
-    uint64 public disputeWindow;
-    uint16 public collateralBps;
-    uint256 public nextStakeId = 1;
-    uint256 public collateralReservedTotal;
-    uint256 public collateralInYield;
+    address public immutable company; // the borrower (deployer)
 
-    mapping(uint256 stakeId => Stake stake) public stakes;
-    mapping(address vendor => uint256 principal) public vendorPrincipalTotal;
-    mapping(address vendor => uint256 allocation) public vendorCreditAllocationTotal;
-    mapping(address vendor => uint256 debt) public currentOutstandingDebt;
-    mapping(address vendor => uint256 obligation) public priorityObligation;
-    mapping(address vendor => uint256 count) public platformDrawdownCount;
-    mapping(address vendor => uint256 count) public platformRepaymentCount;
-    mapping(address vendor => uint256 count) public onTimeRepaymentCount;
-    mapping(address vendor => uint256 count) public lateRepaymentCount;
-    mapping(address vendor => uint256 amount) public totalRepaidAmount;
-    mapping(address vendor => uint64 dueAt) public currentDebtDueAt;
+    address public keystoneForwarder; // authorized credit-terms reporter
+    uint64 public repaymentWindow; // due-date horizon from the first drawdown of a cycle
+    uint64 public defaultGracePeriod; // grace after the due date before a permissionless default
+    uint16 public minReserveBps; // fraction of total assets kept liquid for redemptions
 
-    mapping(address vendor => uint256 cap) internal _vendorCreditCap;
-    mapping(address vendor => uint64 expiry) internal _vendorCapExpiry;
-    mapping(address vendor => uint16 allocationBps) internal _vendorCreditAllocationBps;
+    // --- pool / share accounting (cash basis) ---
+    uint256 public cash; // USDC held by the pool, available to lend or redeem
+    uint256 public outstandingPrincipal; // drawn by the company, not yet repaid
+    uint256 public totalShares;
+    mapping(address member => uint256 shares) public sharesOf;
 
-    // --- World ID personhood (one free subscription per human) ---
-    // Validation happens off-chain (World ID cloud verify); the backend signs an EIP-712
-    // voucher that this contract verifies. The nullifierHash is the uniqueness key.
-    bytes32 public constant PERSONHOOD_TYPEHASH =
-        keccak256("Personhood(address user,bytes32 nullifierHash,uint64 deadline)");
-    bytes32 public immutable DOMAIN_SEPARATOR;
-    address public worldIdSigner;
-    mapping(bytes32 nullifierHash => bool used) public usedNullifier;
+    // --- interest accrual ---
+    uint256 public interestDue; // accrued, unpaid interest owed by the company
+    uint64 public lastAccrual; // timestamp of the last accrual checkpoint
+    uint64 public dueAt; // current cycle due date (0 when there is no debt)
 
-    event Deposited(
-        uint256 indexed stakeId,
-        address indexed user,
-        address indexed vendor,
-        address payer,
-        uint256 amount,
-        uint256 collateral,
-        uint256 creditAllocation
+    // --- credit terms (delivered by Chainlink underwriting via onReport) ---
+    uint256 internal _creditCap;
+    uint64 internal _capExpiry;
+    uint16 public interestRateBps; // APR applied to outstanding principal
+
+    // --- track record (feeds the next underwriting round) ---
+    uint256 public drawdownCount;
+    uint256 public repaymentCount;
+    uint256 public onTimeRepaymentCount;
+    uint256 public lateRepaymentCount;
+    uint256 public totalInterestPaid;
+    uint256 public totalDefaultedAmount;
+    bool public defaulted; // pool has taken at least one default loss
+
+    event Deposited(address indexed member, address indexed payer, uint256 assets, uint256 shares);
+    event Redeemed(address indexed member, uint256 shares, uint256 assets);
+    event SharesTransferred(address indexed from, address indexed to, uint256 shares);
+    event DrawnDown(address indexed company, uint256 amount, uint256 outstandingPrincipal, uint64 dueAt);
+    event Repaid(
+        address indexed company,
+        uint256 principalPaid,
+        uint256 interestPaid,
+        uint256 outstandingPrincipal
     );
-    event DrawnDown(address indexed vendor, uint256 amount, uint256 outstandingDebt);
-    event Repaid(address indexed vendor, uint256 amount, uint256 outstandingDebt);
-    event RepaymentCycleClosed(address indexed vendor, bool onTime, uint64 dueAt);
-    event TreasuryUpdated(address indexed previousTreasury, address indexed newTreasury);
-    event CollateralPulledForYield(address indexed treasury, uint256 amount);
-    event CollateralReturnedFromYield(address indexed treasury, uint256 amount);
-    event Settled(
-        uint256 indexed stakeId,
-        address indexed user,
-        address indexed vendor,
-        uint256 immediateRefund,
-        uint256 pendingObligation
-    );
-    event DisputeRaised(uint256 indexed stakeId, address indexed raisedBy, uint64 disputedAt);
-    event DisputeResolved(
-        uint256 indexed stakeId,
-        Outcome indexed outcome,
-        uint256 userAmount,
-        uint256 vendorAmount,
-        uint256 pendingObligation
-    );
-    event AutoReleased(uint256 indexed stakeId, uint256 immediateRefund, uint256 pendingObligation);
+    event RepaymentCycleClosed(address indexed company, bool onTime, uint64 dueAt);
+    event InterestAccrued(uint256 added, uint256 interestDue);
+    event Defaulted(address indexed company, uint256 principalWrittenOff, uint64 at);
     event CreditTermsUpdated(
-        address indexed vendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps
-    );
-    event WorldIdSignerUpdated(address indexed previousSigner, address indexed newSigner);
-    event PersonhoodVerified(
-        bytes32 indexed nullifierHash, address indexed user, uint256 indexed stakeId
+        address indexed company, uint256 cap, uint64 expiry, uint16 interestRateBps
     );
 
     error InvalidAddress();
     error InvalidAmount();
-    error InvalidCollateralBps();
-    error InvalidCreditAllocationBps();
-    error OnlyVendor();
-    error OnlyTreasury();
-    error OnlyStakeUser();
-    error OnlyStakeParty();
-    error OnlyArbiter();
-    error StakeNotActive();
-    error StakeNotDisputed();
-    error DisputeWindowOpen();
+    error InvalidReserveBps();
+    error InvalidInterestRateBps();
+    error OnlyCompany();
     error CreditLimitExceeded();
+    error InsufficientLiquidity();
     error RepayTooLarge();
     error UnauthorizedReportSender();
-    error WorldIdSignerNotSet();
-    error NullifierAlreadyUsed();
-    error VoucherExpired();
-    error InvalidVoucherSignature();
-    error InvalidSignatureLength();
+    error NotDefaultable();
+    error NoDebt();
+    error InsufficientShares();
 
     constructor(
         IERC20 usdc_,
-        address arbiter_,
         address keystoneForwarder_,
-        uint64 disputeWindow_,
-        uint16 collateralBps_
+        uint64 repaymentWindow_,
+        uint64 defaultGracePeriod_,
+        uint16 minReserveBps_
     ) {
-        if (address(usdc_) == address(0) || arbiter_ == address(0)) {
-            revert InvalidAddress();
-        }
-        if (collateralBps_ > BPS) revert InvalidCollateralBps();
+        if (address(usdc_) == address(0)) revert InvalidAddress();
+        if (minReserveBps_ > BPS) revert InvalidReserveBps();
 
         usdc = usdc_;
-        vendor = msg.sender;
-        arbiter = arbiter_;
+        company = msg.sender;
         keystoneForwarder = keystoneForwarder_;
-        treasury = msg.sender;
-        disputeWindow = disputeWindow_;
-        collateralBps = collateralBps_;
-
-        DOMAIN_SEPARATOR = keccak256(
-            abi.encode(
-                keccak256(
-                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-                ),
-                keccak256(bytes("StakeAndAdvance")),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(this)
-            )
-        );
+        repaymentWindow = repaymentWindow_;
+        defaultGracePeriod = defaultGracePeriod_;
+        minReserveBps = minReserveBps_;
+        lastAccrual = uint64(block.timestamp);
     }
 
-    modifier onlyVendor() {
-        if (msg.sender != vendor) revert OnlyVendor();
+    modifier onlyCompany() {
+        if (msg.sender != company) revert OnlyCompany();
         _;
     }
 
-    modifier onlyTreasury() {
-        if (msg.sender != treasury) revert OnlyTreasury();
-        _;
+    // ----------------------------------------------------------------------------------
+    // Views
+    // ----------------------------------------------------------------------------------
+
+    /// @notice Total pool value backing the shares (cash basis): liquid cash + principal out on loan.
+    function totalAssets() public view returns (uint256) {
+        return cash + outstandingPrincipal;
     }
 
-    /// @notice Ungated deposit (e.g. EOA or relayer paying on behalf of `user`).
-    function deposit(address user, uint256 amount) external nonReentrant returns (uint256 stakeId) {
-        return _deposit(user, amount);
+    /// @notice Shares minted for `assets` deposited at the current NAV.
+    function previewDeposit(uint256 assets) public view returns (uint256) {
+        uint256 supply = totalShares;
+        uint256 backing = totalAssets();
+        if (supply == 0 || backing == 0) return assets; // bootstrap: 1 share == 1 USDC
+        return assets * supply / backing;
     }
 
-    /// @notice One-free-subscription-per-human deposit. World ID proof is validated off-chain
-    /// (cloud verify); the backend signs an EIP-712 voucher over (user, nullifierHash, deadline)
-    /// with `worldIdSigner`. The nullifierHash (unique per app+action per person) is consumed
-    /// here so a single human cannot claim a second free subscription / credit allocation.
-    function depositWithPersonhood(
-        address user,
-        uint256 amount,
-        bytes32 nullifierHash,
-        uint64 deadline,
-        bytes calldata signature
-    ) external nonReentrant returns (uint256 stakeId) {
-        if (worldIdSigner == address(0)) revert WorldIdSignerNotSet();
-        if (block.timestamp > deadline) revert VoucherExpired();
-        if (usedNullifier[nullifierHash]) revert NullifierAlreadyUsed();
-
-        bytes32 structHash =
-            keccak256(abi.encode(PERSONHOOD_TYPEHASH, user, nullifierHash, deadline));
-        bytes32 digest = keccak256(abi.encodePacked(hex"1901", DOMAIN_SEPARATOR, structHash));
-        if (_recover(digest, signature) != worldIdSigner) revert InvalidVoucherSignature();
-
-        usedNullifier[nullifierHash] = true;
-        stakeId = _deposit(user, amount);
-        emit PersonhoodVerified(nullifierHash, user, stakeId);
+    /// @notice USDC returned for burning `shares` at the current NAV.
+    function previewRedeem(uint256 shares) public view returns (uint256) {
+        uint256 supply = totalShares;
+        if (supply == 0) return 0;
+        return shares * totalAssets() / supply;
     }
 
-    function _deposit(address user, uint256 amount) internal returns (uint256 stakeId) {
-        if (user == address(0)) revert InvalidAddress();
-        if (amount == 0) revert InvalidAmount();
-
-        uint256 creditAllocation = amount * _activeCreditAllocationBps(vendor) / BPS;
-        uint256 collateral = amount - creditAllocation;
-
-        stakeId = nextStakeId++;
-        stakes[stakeId] = Stake({
-            user: user,
-            vendor: vendor,
-            amount: amount,
-            collateral: collateral,
-            creditAllocation: creditAllocation,
-            pendingObligation: 0,
-            state: StakeState.Active,
-            createdAt: uint64(block.timestamp),
-            disputedAt: 0
-        });
-
-        vendorCreditAllocationTotal[vendor] += creditAllocation;
-        vendorPrincipalTotal[vendor] += amount;
-        collateralReservedTotal += collateral;
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-
-        emit Deposited(stakeId, user, vendor, msg.sender, amount, collateral, creditAllocation);
+    /// @notice NAV per share scaled to 1e18 (for display / off-chain math).
+    function navPerShare1e18() external view returns (uint256) {
+        if (totalShares == 0) return 1e18;
+        return totalAssets() * 1e18 / totalShares;
     }
 
-    function effectiveCreditLimit(address vendor_) public view returns (uint256) {
-        uint256 cap = _activeCreditCap(vendor_);
-        uint256 allocation = vendorCreditAllocationTotal[vendor_];
-        return cap < allocation ? cap : allocation;
+    function creditCap() external view returns (uint256) {
+        return _creditCap;
     }
 
-    function availableCredit(address vendor_) external view returns (uint256) {
-        uint256 limit = effectiveCreditLimit(vendor_);
-        uint256 outstanding = currentOutstandingDebt[vendor_];
-        return outstanding >= limit ? 0 : limit - outstanding;
+    function capExpiry() external view returns (uint64) {
+        return _capExpiry;
     }
 
-    function vendorCreditCap(address vendor_) external view returns (uint256) {
-        return _vendorCreditCap[vendor_];
+    /// @notice The credit cap if still within its TTL, else 0 (expired underwriting freezes borrowing).
+    function activeCreditCap() public view returns (uint256) {
+        if (_capExpiry != 0 && block.timestamp > _capExpiry) return 0;
+        return _creditCap;
     }
 
-    function vendorCapExpiry(address vendor_) external view returns (uint64) {
-        return _vendorCapExpiry[vendor_];
+    /// @notice Maximum total principal the company may have outstanding right now.
+    function effectiveCreditLimit() public view returns (uint256) {
+        return activeCreditCap();
     }
 
-    function defaultCreditAllocationBps() public view returns (uint16) {
-        return BPS - collateralBps;
+    /// @notice How much the company can draw right now (min of cap headroom and lendable cash).
+    function availableToBorrow() public view returns (uint256) {
+        uint256 limit = activeCreditCap();
+        uint256 headroom = outstandingPrincipal >= limit ? 0 : limit - outstandingPrincipal;
+        uint256 liquid = _lendableCash();
+        return headroom < liquid ? headroom : liquid;
     }
 
-    function vendorCreditAllocationBps(address vendor_) external view returns (uint16) {
-        return _activeCreditAllocationBps(vendor_);
+    /// @notice Cash above the required liquidity reserve (the part that may be lent out).
+    function _lendableCash() internal view returns (uint256) {
+        uint256 required = totalAssets() * minReserveBps / BPS;
+        if (cash <= required) return 0;
+        return cash - required;
     }
 
-    function platformTrackRecord(address vendor_)
+    /// @notice Interest owed by the company including not-yet-checkpointed accrual.
+    function accruedInterest() public view returns (uint256) {
+        return interestDue + _pendingInterest();
+    }
+
+    function _pendingInterest() internal view returns (uint256) {
+        if (outstandingPrincipal == 0 || interestRateBps == 0) return 0;
+        uint256 dt = block.timestamp - lastAccrual;
+        return outstandingPrincipal * interestRateBps * dt / (uint256(BPS) * SECONDS_PER_YEAR);
+    }
+
+    /// @notice Repayment history + current exposure, consumed by the underwriting model.
+    function trackRecord()
         external
         view
         returns (
-            uint256 drawdownCount,
-            uint256 repaymentCount,
-            uint256 onTimeCount,
-            uint256 lateCount,
-            uint256 repaidAmount,
-            uint256 outstandingDebt,
+            uint256 drawdowns,
+            uint256 repayments,
+            uint256 onTime,
+            uint256 late,
+            uint256 interestPaid,
+            uint256 defaultedAmount,
+            uint256 outstanding,
             uint64 debtDueAt
         )
     {
         return (
-            platformDrawdownCount[vendor_],
-            platformRepaymentCount[vendor_],
-            onTimeRepaymentCount[vendor_],
-            lateRepaymentCount[vendor_],
-            totalRepaidAmount[vendor_],
-            currentOutstandingDebt[vendor_],
-            currentDebtDueAt[vendor_]
+            drawdownCount,
+            repaymentCount,
+            onTimeRepaymentCount,
+            lateRepaymentCount,
+            totalInterestPaid,
+            totalDefaultedAmount,
+            outstandingPrincipal,
+            dueAt
         );
     }
 
-    function drawdown(uint256 amount) external onlyVendor nonReentrant {
-        if (amount == 0) revert InvalidAmount();
-
-        uint256 outstanding = currentOutstandingDebt[msg.sender];
-        uint256 nextDebt = outstanding + amount;
-        if (nextDebt > effectiveCreditLimit(msg.sender)) revert CreditLimitExceeded();
-
-        currentOutstandingDebt[msg.sender] = nextDebt;
-        platformDrawdownCount[msg.sender] += 1;
-        if (outstanding == 0) {
-            currentDebtDueAt[msg.sender] = uint64(block.timestamp + REPAYMENT_WINDOW);
-        }
-        usdc.safeTransfer(msg.sender, amount);
-
-        emit DrawnDown(msg.sender, amount, nextDebt);
+    /// @notice One-call snapshot of the whole pool (for the backend / frontend).
+    function poolState()
+        external
+        view
+        returns (
+            uint256 assets,
+            uint256 liquidCash,
+            uint256 outstanding,
+            uint256 shares,
+            uint256 navPerShare,
+            uint256 cap,
+            uint64 expiry,
+            uint16 rateBps,
+            uint64 debtDueAt,
+            bool isDefaulted
+        )
+    {
+        uint256 nav = totalShares == 0 ? 1e18 : totalAssets() * 1e18 / totalShares;
+        return (
+            totalAssets(),
+            cash,
+            outstandingPrincipal,
+            totalShares,
+            nav,
+            _creditCap,
+            _capExpiry,
+            interestRateBps,
+            dueAt,
+            defaulted
+        );
     }
 
-    function repay(uint256 amount) external onlyVendor nonReentrant {
+    // ----------------------------------------------------------------------------------
+    // Interest accrual
+    // ----------------------------------------------------------------------------------
+
+    /// @dev Checkpoint interest. MUST be called before any mutation of `outstandingPrincipal`
+    ///      or `interestRateBps` so the piecewise integral stays exact.
+    function _accrue() internal {
+        uint256 pending = _pendingInterest();
+        if (pending != 0) {
+            interestDue += pending;
+            emit InterestAccrued(pending, interestDue);
+        }
+        lastAccrual = uint64(block.timestamp);
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Member deposit / redeem (the "be the bank" side)
+    // ----------------------------------------------------------------------------------
+
+    /// @notice Deposit USDC and receive shares at the current NAV.
+    function deposit(uint256 amount) external nonReentrant returns (uint256 shares) {
+        return _deposit(msg.sender, amount);
+    }
+
+    /// @notice Deposit on behalf of `member` (relayer / embedded-wallet funding seam, e.g. Dynamic).
+    ///         `msg.sender` pays; `member` receives the shares.
+    function depositFor(address member, uint256 amount)
+        external
+        nonReentrant
+        returns (uint256 shares)
+    {
+        return _deposit(member, amount);
+    }
+
+    function _deposit(address member, uint256 amount) internal returns (uint256 shares) {
+        if (member == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
 
-        uint256 outstanding = currentOutstandingDebt[msg.sender];
-        if (amount > outstanding) revert RepayTooLarge();
-
-        uint256 nextOutstanding = outstanding - amount;
-        currentOutstandingDebt[msg.sender] = nextOutstanding;
-        _reducePriorityObligation(msg.sender, amount);
-        totalRepaidAmount[msg.sender] += amount;
+        shares = previewDeposit(amount); // priced on pre-deposit assets
         usdc.safeTransferFrom(msg.sender, address(this), amount);
+        cash += amount;
+        totalShares += shares;
+        sharesOf[member] += shares;
 
-        if (nextOutstanding == 0) {
-            _closeRepaymentCycle(msg.sender);
+        emit Deposited(member, msg.sender, amount, shares);
+    }
+
+    /// @notice Burn shares and withdraw USDC at the current NAV (bounded by liquid cash).
+    function redeem(uint256 shares) external nonReentrant returns (uint256 assets) {
+        if (shares == 0) revert InvalidAmount();
+        if (sharesOf[msg.sender] < shares) revert InsufficientShares();
+
+        assets = previewRedeem(shares);
+        if (assets > cash) revert InsufficientLiquidity();
+
+        sharesOf[msg.sender] -= shares;
+        totalShares -= shares;
+        cash -= assets;
+        usdc.safeTransfer(msg.sender, assets);
+
+        emit Redeemed(msg.sender, shares, assets);
+    }
+
+    /// @notice Transfer shares to another holder (keeps the position tradeable / transferable).
+    function transferShares(address to, uint256 shares) external {
+        if (to == address(0)) revert InvalidAddress();
+        if (sharesOf[msg.sender] < shares) revert InsufficientShares();
+
+        sharesOf[msg.sender] -= shares;
+        sharesOf[to] += shares;
+
+        emit SharesTransferred(msg.sender, to, shares);
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Company credit line (interest-bearing)
+    // ----------------------------------------------------------------------------------
+
+    /// @notice Company draws against the underwritten credit line, bounded by cap and liquid reserve.
+    function drawdown(uint256 amount) external onlyCompany nonReentrant {
+        if (amount == 0) revert InvalidAmount();
+        _accrue();
+
+        uint256 nextDebt = outstandingPrincipal + amount;
+        if (nextDebt > activeCreditCap()) revert CreditLimitExceeded();
+        if (amount > _lendableCash()) revert InsufficientLiquidity();
+
+        if (outstandingPrincipal == 0) {
+            dueAt = uint64(block.timestamp) + repaymentWindow;
+        }
+        outstandingPrincipal = nextDebt;
+        cash -= amount;
+        drawdownCount += 1;
+        usdc.safeTransfer(company, amount);
+
+        emit DrawnDown(company, amount, nextDebt, dueAt);
+    }
+
+    /// @notice Company repays; payment covers accrued interest first, then principal. Interest paid in
+    ///         raises `totalAssets` (and therefore NAV) — that is the yield members earn.
+    function repay(uint256 amount) external onlyCompany nonReentrant {
+        if (amount == 0) revert InvalidAmount();
+        _accrue();
+
+        uint256 interestPortion = amount <= interestDue ? amount : interestDue;
+        uint256 principalPortion = amount - interestPortion;
+        if (principalPortion > outstandingPrincipal) revert RepayTooLarge();
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        cash += amount;
+        interestDue -= interestPortion;
+        outstandingPrincipal -= principalPortion;
+        totalInterestPaid += interestPortion;
+
+        if (outstandingPrincipal == 0 && interestDue == 0) {
+            _closeCycle();
         }
 
-        emit Repaid(msg.sender, amount, nextOutstanding);
+        emit Repaid(company, principalPortion, interestPortion, outstandingPrincipal);
     }
 
-    function setWorldIdSigner(address newSigner) external onlyVendor {
-        if (newSigner == address(0)) revert InvalidAddress();
-
-        address previousSigner = worldIdSigner;
-        worldIdSigner = newSigner;
-
-        emit WorldIdSignerUpdated(previousSigner, newSigner);
-    }
-
-    function setTreasury(address newTreasury) external onlyVendor {
-        if (newTreasury == address(0)) revert InvalidAddress();
-
-        address previousTreasury = treasury;
-        treasury = newTreasury;
-
-        emit TreasuryUpdated(previousTreasury, newTreasury);
-    }
-
-    function pullCollateralForYield(uint256 amount) external onlyTreasury nonReentrant {
-        if (amount == 0) revert InvalidAmount();
-        if (collateralInYield + amount > collateralReservedTotal) revert InvalidAmount();
-
-        collateralInYield += amount;
-        usdc.safeTransfer(treasury, amount);
-
-        emit CollateralPulledForYield(treasury, amount);
-    }
-
-    function returnCollateralFromYield(uint256 amount) external onlyTreasury nonReentrant {
-        if (amount == 0) revert InvalidAmount();
-        if (amount > collateralInYield) revert InvalidAmount();
-
-        collateralInYield -= amount;
-        usdc.safeTransferFrom(treasury, address(this), amount);
-
-        emit CollateralReturnedFromYield(treasury, amount);
-    }
-
-    function cancel(uint256 stakeId) external nonReentrant {
-        Stake storage stake = stakes[stakeId];
-        if (stake.state != StakeState.Active) revert StakeNotActive();
-        if (msg.sender != stake.user) revert OnlyStakeUser();
-
-        (uint256 immediateRefund, uint256 pendingObligation) =
-            _settleByCreditRule(stakeId, StakeState.Cancelled);
-
-        emit Settled(stakeId, stake.user, stake.vendor, immediateRefund, pendingObligation);
-    }
-
-    function raiseDispute(uint256 stakeId) external {
-        Stake storage stake = stakes[stakeId];
-        if (stake.state != StakeState.Active) revert StakeNotActive();
-        if (msg.sender != stake.user && msg.sender != stake.vendor) revert OnlyStakeParty();
-
-        stake.state = StakeState.Disputed;
-        stake.disputedAt = uint64(block.timestamp);
-
-        emit DisputeRaised(stakeId, msg.sender, uint64(block.timestamp));
-    }
-
-    function resolveDispute(uint256 stakeId, Outcome outcome) external nonReentrant {
-        if (msg.sender != arbiter) revert OnlyArbiter();
-
-        Stake storage stake = stakes[stakeId];
-        if (stake.state != StakeState.Disputed) revert StakeNotDisputed();
-
-        _removeAllocation(stake);
-        stake.state = StakeState.Resolved;
-
-        uint256 userAmount;
-        uint256 vendorAmount;
-        uint256 pendingObligation;
-
-        if (outcome == Outcome.RefundUser) {
-            userAmount = stake.amount;
-        } else if (outcome == Outcome.ReleaseToVendor) {
-            vendorAmount = stake.amount;
+    function _closeCycle() internal {
+        bool onTime = dueAt == 0 || block.timestamp <= dueAt;
+        repaymentCount += 1;
+        if (onTime) {
+            onTimeRepaymentCount += 1;
         } else {
-            userAmount = stake.collateral;
-            vendorAmount = stake.creditAllocation;
+            lateRepaymentCount += 1;
         }
-
-        if (userAmount != 0) usdc.safeTransfer(stake.user, userAmount);
-        if (vendorAmount != 0) usdc.safeTransfer(stake.vendor, vendorAmount);
-
-        emit DisputeResolved(stakeId, outcome, userAmount, vendorAmount, pendingObligation);
+        emit RepaymentCycleClosed(company, onTime, dueAt);
+        dueAt = 0;
     }
 
-    function autoRelease(uint256 stakeId) external nonReentrant {
-        Stake storage stake = stakes[stakeId];
-        if (stake.state != StakeState.Disputed) revert StakeNotDisputed();
-        if (block.timestamp <= stake.disputedAt + disputeWindow) revert DisputeWindowOpen();
+    /// @notice Permissionless: once the debt is past due + grace, write off the outstanding principal
+    ///         as a pool loss. `totalAssets` (and NAV) fall; shareholders bear the loss pro-rata.
+    function markDefaulted() external nonReentrant {
+        if (outstandingPrincipal == 0) revert NoDebt();
+        if (dueAt == 0 || block.timestamp <= uint256(dueAt) + defaultGracePeriod) {
+            revert NotDefaultable();
+        }
+        _accrue();
 
-        (uint256 immediateRefund, uint256 pendingObligation) =
-            _settleByCreditRule(stakeId, StakeState.Resolved);
+        uint256 writeOff = outstandingPrincipal;
+        outstandingPrincipal = 0;
+        interestDue = 0; // unpaid interest was never an asset; clear it
+        totalDefaultedAmount += writeOff;
+        lateRepaymentCount += 1;
+        defaulted = true;
+        dueAt = 0;
 
-        emit AutoReleased(stakeId, immediateRefund, pendingObligation);
+        emit Defaulted(company, writeOff, uint64(block.timestamp));
     }
 
-    function onReport(bytes calldata, bytes calldata report) external virtual override {
+    // ----------------------------------------------------------------------------------
+    // Credit-terms delivery (Chainlink Confidential AI underwriting)
+    // ----------------------------------------------------------------------------------
+
+    /// @notice Authorized reporter delivers the underwritten credit terms:
+    ///         abi.encode(company, creditCap, expiry, interestRateBps).
+    function onReport(bytes calldata, bytes calldata report) external override {
         if (msg.sender != keystoneForwarder) revert UnauthorizedReportSender();
 
-        (address reportVendor, uint256 cap, uint64 expiry, uint16 creditAllocationBps) =
+        (address reportCompany, uint256 cap, uint64 expiry, uint16 rateBps) =
             abi.decode(report, (address, uint256, uint64, uint16));
-        _setCreditTerms(reportVendor, cap, expiry, creditAllocationBps);
-    }
+        if (rateBps > MAX_INTEREST_RATE_BPS) revert InvalidInterestRateBps();
 
-    function _setCreditCap(address vendor_, uint256 cap, uint64 expiry) internal {
-        _setCreditTerms(vendor_, cap, expiry, defaultCreditAllocationBps());
-    }
+        _accrue(); // settle interest at the old rate before repricing
+        _creditCap = cap;
+        _capExpiry = expiry;
+        interestRateBps = rateBps;
 
-    function _setCreditTerms(
-        address vendor_,
-        uint256 cap,
-        uint64 expiry,
-        uint16 creditAllocationBps
-    ) internal {
-        if (vendor_ == address(0)) revert InvalidAddress();
-        if (creditAllocationBps > MAX_CREDIT_ALLOCATION_BPS) revert InvalidCreditAllocationBps();
-        _vendorCreditCap[vendor_] = cap;
-        _vendorCapExpiry[vendor_] = expiry;
-        _vendorCreditAllocationBps[vendor_] = creditAllocationBps;
-        emit CreditTermsUpdated(vendor_, cap, expiry, creditAllocationBps);
-    }
-
-    function _activeCreditCap(address vendor_) internal view returns (uint256) {
-        uint64 expiry = _vendorCapExpiry[vendor_];
-        if (expiry != 0 && block.timestamp > expiry) return 0;
-        return _vendorCreditCap[vendor_];
-    }
-
-    function _activeCreditAllocationBps(address vendor_) internal view returns (uint16) {
-        uint64 expiry = _vendorCapExpiry[vendor_];
-        if (expiry != 0 && block.timestamp > expiry) return defaultCreditAllocationBps();
-
-        uint16 allocationBps = _vendorCreditAllocationBps[vendor_];
-        return allocationBps == 0 ? defaultCreditAllocationBps() : allocationBps;
-    }
-
-    function _attributedDebt(address vendor_, uint256 allocation, uint256 totalAllocation)
-        internal
-        view
-        returns (uint256)
-    {
-        if (allocation == 0 || totalAllocation == 0) return 0;
-
-        uint256 outstanding = currentOutstandingDebt[vendor_];
-        uint256 debtShare = outstanding * allocation / totalAllocation;
-        return debtShare > allocation ? allocation : debtShare;
-    }
-
-    function _settleByCreditRule(uint256 stakeId, StakeState finalState)
-        internal
-        returns (uint256 immediateRefund, uint256 pendingObligation)
-    {
-        Stake storage stake = stakes[stakeId];
-        uint256 totalAllocationBeforeSettle = vendorCreditAllocationTotal[stake.vendor];
-
-        pendingObligation =
-            _attributedDebt(stake.vendor, stake.creditAllocation, totalAllocationBeforeSettle);
-        immediateRefund = stake.amount - pendingObligation;
-
-        stake.pendingObligation = pendingObligation;
-        stake.state = finalState;
-        _removeAllocation(stake);
-
-        if (pendingObligation != 0) {
-            priorityObligation[stake.vendor] += pendingObligation;
-        }
-
-        usdc.safeTransfer(stake.user, immediateRefund);
-    }
-
-    function _removeAllocation(Stake storage stake) internal {
-        vendorPrincipalTotal[stake.vendor] -= stake.amount;
-        vendorCreditAllocationTotal[stake.vendor] -= stake.creditAllocation;
-        collateralReservedTotal -= stake.collateral;
-    }
-
-    function _reducePriorityObligation(address vendor_, uint256 amount) internal {
-        uint256 obligation = priorityObligation[vendor_];
-        if (obligation == 0) return;
-        priorityObligation[vendor_] = amount >= obligation ? 0 : obligation - amount;
-    }
-
-    /// @dev EIP-2098-free 65-byte ECDSA recovery with low-s + canonical-v enforcement.
-    function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
-        if (signature.length != 65) revert InvalidSignatureLength();
-
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 0x20))
-            v := byte(0, calldataload(add(signature.offset, 0x40)))
-        }
-        if (
-            uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
-        ) revert InvalidVoucherSignature();
-        if (v != 27 && v != 28) revert InvalidVoucherSignature();
-
-        address signer = ecrecover(digest, v, r, s);
-        if (signer == address(0)) revert InvalidVoucherSignature();
-        return signer;
-    }
-
-    function _closeRepaymentCycle(address vendor_) internal {
-        uint64 dueAt = currentDebtDueAt[vendor_];
-        bool onTime = dueAt == 0 || block.timestamp <= dueAt;
-
-        platformRepaymentCount[vendor_] += 1;
-        if (onTime) {
-            onTimeRepaymentCount[vendor_] += 1;
-        } else {
-            lateRepaymentCount[vendor_] += 1;
-        }
-
-        currentDebtDueAt[vendor_] = 0;
-        emit RepaymentCycleClosed(vendor_, onTime, dueAt);
+        emit CreditTermsUpdated(reportCompany, cap, expiry, rateBps);
     }
 }

@@ -10,7 +10,7 @@
     "server": "tsx server/index.ts",
     "server:local": "bash scripts/server.local.sh",
     "deploy:arc": "bash scripts/deploy.arc.sh",
-    "keeper:auto-release": "tsx keeper/autoRelease.ts"
+    "keeper:mark-default": "tsx keeper/markDefault.ts"
   },
   "dependencies": {
     "@chainlink/cre-sdk": "^1.6.0",

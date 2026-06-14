@@ -1,17 +1,9 @@
-export type WorldIdMode = "dev" | "cloud";
-
 export type ServerConfig = {
   port: number;
   rpcUrl: string;
   chainId: number;
   contract: `0x${string}`;
   reporterKey: `0x${string}`;
-  worldIdSignerKey: `0x${string}`;
-  worldIdMode: WorldIdMode;
-  worldAction: string;
-  worldAppId: string | undefined;
-  worldVerifyUrl: string | undefined;
-  voucherTtlSeconds: number;
   confidentialAiEndpoint: string | undefined;
   confidentialAiApiKey: string | undefined;
 };
@@ -35,12 +27,6 @@ export function configFromEnv(overrides: Partial<ServerConfig> = {}): ServerConf
     chainId: Number(process.env.CHAIN_ID ?? 31337),
     contract: (process.env.STAKE_AND_ADVANCE_ADDRESS as `0x${string}`) ?? "0x",
     reporterKey: asHex("REPORTER_PRIVATE_KEY"),
-    worldIdSignerKey: asHex("WORLD_ID_SIGNER_PRIVATE_KEY"),
-    worldIdMode: (process.env.WORLD_ID_MODE as WorldIdMode) ?? "dev",
-    worldAction: process.env.WORLD_ACTION ?? "claim-free-subscription",
-    worldAppId: process.env.WORLD_APP_ID,
-    worldVerifyUrl: process.env.WORLD_VERIFY_URL,
-    voucherTtlSeconds: Number(process.env.VOUCHER_TTL_SECONDS ?? 900),
     confidentialAiEndpoint: process.env.CONFIDENTIAL_AI_ENDPOINT,
     confidentialAiApiKey: process.env.CONFIDENTIAL_AI_API_KEY,
     ...overrides,
